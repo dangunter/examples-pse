@@ -48,9 +48,7 @@ class Bossy:
         self._worker_kwargs = kwargs
         self.processes, self.logging_thread = None, None
         # add work, including sentinels to stop processes, and wait for it all to be processed
-        self._add_work(work)
-        sentinels = [None for i in range(self.n)]
-        self._add_work(sentinels)
+        self._with_deps = self._add_work_with_dependencies(work)
         self._handle_signals()
 
     def _handle_signals(self):
@@ -76,6 +74,7 @@ class Bossy:
         # start workers and thread to tail the log messages
         self.processes = self._create_worker_processes(self._worker_kwargs)
         self.logging_thread = self._create_logging_thread()
+        self._satisfy_dependencies()
         self._join_worker_processes()
         self.processes = None
         # stop logging thread
@@ -98,6 +97,21 @@ class Bossy:
         for item in items:
             self.work_q.put(item)
 
+    def _add_sentinels(self):
+        sentinels = [None for i in range(self.n)]
+        self._add_work(sentinels)
+
+    def _add_work_with_dependencies(self, items):
+        has_deps, no_deps = [], []
+        for item in items:
+            if item.has_dependencies():  # XXX: Implies an interface for the item
+                has_deps.append(item)
+            else:
+                no_deps.append(item)
+        assert len(no_deps) > 0
+        self._add_work(no_deps)
+        return has_deps
+
     def _create_worker_processes(self, kwargs):
         self.log.debug(f"Create worker processes. kwargs={kwargs}")
         processes = []
@@ -108,6 +122,7 @@ class Bossy:
                 args=(
                     i,
                     self.work_q,
+                    self.dep_q,
                     self.log_q,
                     self.result_q,
                     self.done_q,
@@ -121,7 +136,7 @@ class Bossy:
         return processes
 
     @staticmethod
-    def worker(id_, q, log_q, result_q, done_q, func, kwargs):
+    def worker(id_, work_q, deps_q, log_q, result_q, done_q, func, kwargs):
         pfx = f"[Worker {id_} Main-Loop]"
 
         def log_info(m, pfx=pfx):
@@ -135,7 +150,12 @@ class Bossy:
 
         log_info("begin")
         result_list = []
+        q = work_q
         while True:
+            if q.empty():
+                # waiting for dependencies to be satisfied
+                time.sleep(0.1)
+                continue
             item = q.get()
             log_debug("Got next item of work from queue")
             if item is None:  # sentinel
@@ -181,7 +201,7 @@ class Bossy:
         while num_joined + num_unjoinable < num_proc:
             self.log.debug(f"Waiting for {num_proc - num_joined - num_unjoinable} processes to finish")
             try:
-                id_ = self.done_q.get(timeout=60)
+                id_, path = self.done_q.get(timeout=60)
             except Empty:
                 # Interruptible wait allowing for control-c
                 time.sleep(1)
@@ -202,8 +222,30 @@ class Bossy:
                 self.log.debug(f"Joining process: {proc}")
                 proc.join()
                 num_joined += 1
+            #
+            self._update_dependencies(path)
         if num_unjoinable > 0:
             self.log.error(f"{num_unjoinable} processes could not be joined")
+
+    def _update_dependencies(self, path):
+        # If there are no items with dependencies waiting to be satisfied, nothing to do
+        if not self._with_deps:
+            return
+        # Check of any jobs had their dependencies satisfied
+        satisfied = []
+        for item in self._with_deps:
+            if item.needs(path):
+                item.remove_dependency(path)
+                if not item.has_dependencies():
+                    satisfied.append(item)
+        # add all jobs now satisfied to the work queue, and remove from list of items waiting around
+        for item in satisfied:
+            self.work_q.put(item)
+            self._with_deps.remove(item)
+        # if there are not more items waiting around to have their dependencies satisfied, add the
+        # "all done, for real" sentinels. Subsequent calls to this method will return immediately.
+        if not self._with_deps:
+            self._add_sentinels()
 
     def _join_logging_thread(self):
         self.logging_thread.join()

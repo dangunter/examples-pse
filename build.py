@@ -264,7 +264,40 @@ class Builder(ABC):
             self.s.set(key, value)
 
 
-Job = namedtuple("Job", ["nb", "tmpdir", "outdir", "depth"])
+#Job = namedtuple("Job", ["nb", "tmpdir", "outdir", "depth"])
+
+class Job:
+    def __init__(self, nb, srcdir, tmpdir=None, outdir=None, depth=None):
+        self.nb, self.srcdir = nb, Path(srcdir).absolute()
+        self.path = srcdir / nb
+        self.tmpdir, self.outdir, self.depth = tmpdir, outdir, depth
+        self._deps = set()
+
+    def has_dependencies(self) -> bool:
+        return bool(self._deps)
+
+    def add_dependency(self, item):
+        if isinstance(item, Job):
+            path = item.path
+        else:
+            path = Path(item).absolute()
+        self._deps.add(path)
+
+    def remove_dependency(self, item):
+        if isinstance(item, Job):
+            path = item.path
+        else:
+            path = Path(item).absolute()
+        self._deps.remove(path)
+
+    def needs(self, item) -> bool:
+        if not self.has_dependencies():
+            return False
+        if isinstance(item, Job):
+            path = item.path
+        else:
+            path = Path(item).absolute()
+        return path in self._deps
 
 
 class NotebookBuilder(Builder):
@@ -311,6 +344,7 @@ class NotebookBuilder(Builder):
             {},
             {},
         )
+        self._nb_deps = {}
 
     def build(self, options):
         self.s.set_default_section("notebook")
@@ -335,11 +369,20 @@ class NotebookBuilder(Builder):
             "nbconvert.preprocessors.TagRemovePreprocessor"
         ]  # for some reason, this only works with the full module path
         self._nb_remove_config = c
+        # find all the notebooks to convert
         nb_dirs = self.s.get("directories")
         self._results = self.Results()
         self._results.start()
         for item in nb_dirs:
             self.discover_tree(item)
+        # add dependencies
+        for item in self.s.get("dependencies", default=[]):
+            nb = Path(item["notebook"])
+            after = Path(item["after"])
+            if nb in self._nb_deps:
+                self._nb_deps[nb].append(after)
+            else:
+                self._nb_deps[nb] = [after]
         self.convert_discovered_notebooks()
         self._results.stop()
         return self._results
@@ -507,13 +550,16 @@ class NotebookBuilder(Builder):
         # create list of jobs
         jobs = []
         for srcdir, nb_list in self.notebooks_to_convert.items():
-            # template job
-            tj = Job(
-                None, temporary_dirs[srcdir], self.outdir[srcdir], self.depth[srcdir]
-            )
-            # per-notebook real jobs
+            j_tmpdir, j_outdir, j_depth = temporary_dirs[srcdir], self.outdir[srcdir], self.depth[srcdir]
+            # Add jobs for each notebook
             for nb in nb_list:
-                jobs.append(Job(nb, tj.tmpdir, tj.outdir, tj.depth))
+                j = Job(nb=nb, srcdir=srcdir, tmpdir=j_tmpdir, outdir=j_outdir, depth=j_depth)
+                # Add any dependencies for this file
+                if j.path in self._nb_deps:
+                    for dep_path in self._nb_deps[j.path]:
+                        j.add_dependency(dep_path)
+                jobs.append(j)
+
         # process list of jobs, in parallel
         _log.info(f"Process {len(jobs)} notebooks")
         num_workers = min(self._num_workers, len(jobs))

@@ -44,6 +44,9 @@ notebook:
           output: matopt
         - source: surrogate/pysmo
           output: surrogate_models/pysmo
+    dependencies:
+        - notebook: workshops/Parameter_Estimation/DMF_Flash_Unit_Model_with_NRTL_Solution_Testing.ipynb
+          after: workshops/Parameter_Estimation/DMF_for_Parameter_Estimation_NRTL_using_unit_model_solution_testing.ipynb
 
 # Settings for running Sphinx build
 sphinx:
